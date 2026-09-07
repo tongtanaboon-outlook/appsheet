@@ -2,6 +2,7 @@
  * OPTIMIZED ROUTING SCRIPT (PRO VERSION)
  * - รูปแบบ Format แน่นอน (String: Lat, Lng | Lat, Lng / Link: Lat,Lng/Lat,Lng)
  * - ใช้ TextFinder เร่งความเร็วการอ่านข้อมูล
+ * - เลือกจุดสุดท้ายจากระยะทางรวมที่ Routes API คำนวณ ไม่ใช้จุดที่ไกลจากคลังที่สุด
  * - โหมดจราจร: TRAFFIC_UNAWARE (มาตรฐานสำหรับเบิกเงิน)
  * - V8 Engine Support & Optional Chaining
  */
@@ -22,7 +23,6 @@ const DEPOT_COORDS = {
 const RESULT_COLUMN_NAME = "GoogleMapsRoutesAPI";
 const DISTANCE_COLUMN_NAME = "ระยะทาง_GoogleMapAPI_Km";
 const LINK_COLUMN_NAME = "แสดงแผนที่_GoogleMapsRoutesAPI";
-const DEPOT_DISTANCE_COLUMN = "ระยะทางจากคลัง_Km"; 
 
 // =================================================================
 // [ 2 ] MAIN FUNCTION
@@ -37,11 +37,10 @@ function findOptimalRouteUsingExistingDistance(shipmentId, rowId) {
     const waypointsWithDistance = prepareWaypointsWithExistingDistance(ss, shipmentId);
     if (waypointsWithDistance.length <= 1) throw new Error(`No valid waypoints found for Shipment: ${shipmentId}`);
     
-    // 2. จัดลำดับ (ไกลสุดเป็นปลายทาง)
-    const { orderedPoints } = selectFinalDestinationAndSort(waypointsWithDistance);
-    
-    // 3. ยิง API (ระบบมาตรฐาน TRAFFIC_UNAWARE)
-    const result = executeGoogleMapsRoutesAPIOneWay(orderedPoints);
+    // 2. ทดสอบทุกจุดเป็นปลายทาง แล้วเลือกเส้นทางที่มีระยะทางรวมต่ำที่สุด
+    // Routes API จะ optimize เฉพาะ intermediate waypoint จึงไม่ควรเดาปลายทางจาก
+    // ระยะทางเส้นตรง/ระยะทางจากคลังเพียงค่าเดียว
+    const result = findShortestRouteAcrossAllFinalDestinations(waypointsWithDistance);
     
     // 4. บันทึกผล 
     const resultSheet = ss.getSheetByName(SHEET_RESULT);
@@ -73,7 +72,6 @@ function prepareWaypointsWithExistingDistance(ss, shipmentId) {
   const shipmentColIdx = header.indexOf("Shipment No") + 1;
   const latlngColIdx = header.indexOf("จุดส่งสินค้าปลายทาง") + 1;
   const nameColIdx = header.indexOf("ชื่อปลายทาง") + 1;
-  const distanceColIdx = header.indexOf(DEPOT_DISTANCE_COLUMN) + 1;
   
   if (shipmentColIdx === 0 || latlngColIdx === 0) throw new Error("Missing required columns in computed sheet");
   
@@ -89,7 +87,6 @@ function prepareWaypointsWithExistingDistance(ss, shipmentId) {
     name: DEPOT_COORDS.name,
     original: { lat: DEPOT_COORDS.lat, lng: DEPOT_COORDS.lng },
     forApi: { location: { latLng: { latitude: DEPOT_COORDS.lat, longitude: DEPOT_COORDS.lng } } },
-    distance: 0, 
     isDepot: true
   });
   
@@ -111,8 +108,6 @@ function prepareWaypointsWithExistingDistance(ss, shipmentId) {
         const lng = parseFloat(parts[1].trim());
         
         if (!isNaN(lat) && !isNaN(lng)) {
-          // ดึงข้อมูลเสริมด้วย optional (รองรับกรณีคอลัมน์หายไป)
-          const distance = distanceColIdx > 0 ? parseFloat(computedSheet.getRange(rowIdx, distanceColIdx).getValue()) || 0 : 0;
           let name = `Point ${idCounter}`;
           if (nameColIdx > 0) {
             const rawName = computedSheet.getRange(rowIdx, nameColIdx).getValue();
@@ -124,7 +119,6 @@ function prepareWaypointsWithExistingDistance(ss, shipmentId) {
             name: name,
             original: { lat, lng },
             forApi: { location: { latLng: { latitude: lat, longitude: lng } } },
-            distance: distance,
             isDepot: false
           });
         }
@@ -135,21 +129,37 @@ function prepareWaypointsWithExistingDistance(ss, shipmentId) {
   return allPoints;
 }
 
-function selectFinalDestinationAndSort(allPoints) {
+function findShortestRouteAcrossAllFinalDestinations(allPoints) {
   const depot = allPoints[0];
   const destinations = allPoints.slice(1);
-  
-  // เรียงตามระยะทางจากคลัง (มาก -> น้อย)
-  destinations.sort((a, b) => (b.distance || 0) - (a.distance || 0));
+  let bestResult = null;
 
-  const finalDestination = destinations[0]; 
-  const intermediates = destinations.filter(p => p !== finalDestination);
-  
-  return { 
-    orderedPoints: [depot, ...intermediates, finalDestination], 
-    finalDestination, 
-    intermediates 
-  };
+  // Compute Routes requires a fixed destination. For an open route with no
+  // business-mandated final stop, evaluate every customer as that destination and
+  // let the API optimize the remaining intermediate waypoints.
+  destinations.forEach(finalDestination => {
+    const intermediates = destinations.filter(point => point.id !== finalDestination.id);
+    const candidateResult = executeGoogleMapsRoutesAPIOneWay([
+      depot,
+      ...intermediates,
+      finalDestination
+    ]);
+
+    if (!Number.isFinite(candidateResult.totalDistance) || candidateResult.totalDistance < 0) {
+      throw new Error(`Routes API returned an invalid distance for final destination: ${finalDestination.id}`);
+    }
+
+    // Keep the lower ID on an exact tie so the result is deterministic.
+    if (!bestResult ||
+        candidateResult.totalDistance < bestResult.totalDistance ||
+        (candidateResult.totalDistance === bestResult.totalDistance &&
+          finalDestination.id < bestResult.finalDestination.id)) {
+      bestResult = { ...candidateResult, finalDestination };
+    }
+  });
+
+  if (!bestResult) throw new Error("Unable to calculate a route for any final destination");
+  return bestResult;
 }
 
 // =================================================================
